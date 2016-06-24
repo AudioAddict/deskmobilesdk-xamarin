@@ -1,0 +1,612 @@
+//
+//  DSAPIResource.m
+//  DeskAPIClient
+//
+//  Created by Desk.com on 9/20/13.
+//  Copyright (c) 2015, Salesforce.com, Inc.
+//  All rights reserved.
+//
+//  Redistribution and use in source and binary forms, with or without modification, are permitted provided
+//  that the following conditions are met:
+//
+//     Redistributions of source code must retain the above copyright notice, this list of conditions and the
+//     following disclaimer.
+//
+//     Redistributions in binary form must reproduce the above copyright notice, this list of conditions and
+//     the following disclaimer in the documentation and/or other materials provided with the distribution.
+//
+//     Neither the name of Salesforce.com, Inc. nor the names of its contributors may be used to endorse or
+//     promote products derived from this software without specific prior written permission.
+//
+//  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+//  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+//  PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+//  ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+//  TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+//  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+//  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+//  POSSIBILITY OF SUCH DAMAGE.
+//
+
+#import "DSAPIResource.h"
+#import "DSAPIClient.h"
+#import "DSAPIETagCache.h"
+#import "DSAPINetworkIndicatorController.h"
+
+#import <objc/runtime.h>
+#import "DSCHttpStatusCodes.h"
+
+
+#define kETagHeader @"ETag"
+#define kIfNoneMatchHeader @"If-None-Match"
+
+#define kSearchEndpoint @"search"
+
+#define kEncoderKeyDictionary @"DSAPIResourceDictionary"
+#define kEncoderKeyBaseURL @"DSAPIResourceBaseURL"
+
+@interface DSAPIResource ()
+
+@property (nonatomic, strong) NSMutableDictionary *embedded;
+
+@end
+
+@implementation DSAPIResource {
+    NSMutableDictionary *_linksArrays;
+    NSMutableDictionary *_dictionary;
+}
+
++ (DSAPIResource *)resourceWithHref:(NSString *)href client:(DSAPIClient *)client className:(NSString *)className
+{
+    return [[self alloc] initWithDictionary:@{kLinksKey :
+                                                  @{kSelfKey :
+                                                        @{kHrefKey : href,
+                                                          kClassKey : className}}}
+                                     client:client];
+}
+
++ (DSAPIResource *)resourceWithId:(NSString *)resourceId client:(DSAPIClient *)client className:(NSString *)className
+{
+    NSString *classNamePlural = [[client classForClassName:className] classNamePlural];
+    NSString *href = [[NSString stringWithFormat:kAPIPrefix, classNamePlural] stringByAppendingPathComponent:resourceId];
+    return [self resourceWithHref:href client:client className:className];
+}
+
+- (instancetype)initWithDictionary:(NSDictionary *)dictionary client:(DSAPIClient *)client
+{
+    self = [super init];
+    if (self) {
+        _linksArrays = [NSMutableDictionary new];
+        _embedded = [NSMutableDictionary new];
+        _dictionary = [dictionary mutableCopy];
+        _client = client;
+        
+        // If we can't parse the dictionary, just return nil
+        if (![self parseResource]) {
+            return nil;
+        }
+        
+        // Set the class of the object to the class returned by the web service for self
+        object_setClass(self, [self.client classForClassName:_dictionary[kLinksKey][kSelfKey][kClassKey]]);
+    }
+    return self;
+}
+
+- (NSString *)description
+{
+    return [_dictionary description];
+}
+
+- (DSAPILink *)classLink
+{
+    @throw [NSException exceptionWithName:NSInternalInconsistencyException
+                                   reason:[NSString stringWithFormat:@"You must override %@ in a subclass", NSStringFromSelector(_cmd)]
+                                 userInfo:nil];
+}
+
+- (BOOL)parseResource
+{
+    if (![NSJSONSerialization isValidJSONObject:_dictionary]) {
+        return NO;
+    }
+    if (!self.client.baseURL) {
+        return NO;
+    }
+    if (![self parseLinks]) {
+        return NO;
+    }
+    if (![self parseEmbedded]) {
+        return NO;
+    }
+    if (![self parseNew]) {
+        return NO;
+    }
+    if (![self parseChanged]) {
+        return NO;
+    }
+    return YES;
+}
+
+- (BOOL)parseLinks
+{
+    id linkDictionaries = _dictionary[kLinksKey];
+    if (!linkDictionaries) {
+        return YES;
+    }
+    if (![linkDictionaries isKindOfClass:[NSDictionary class]]) {
+        return NO;
+    }
+    for (id relation in [linkDictionaries allKeys]) {
+        id linkOrLinks = linkDictionaries[relation];
+        NSArray *links = [self extractLinkOrLinks:linkOrLinks];
+        if (!links) {
+            _linksArrays[relation] = [NSNull null];
+        } else {
+            _linksArrays[relation] = links;
+        }
+    }
+    return YES;
+}
+
+- (NSArray *)extractLinkOrLinks:(id)linkOrLinks
+{
+    if ([linkOrLinks isKindOfClass:[NSDictionary class]]) {
+        return [self extractArrayOfLinks:@[ linkOrLinks ]];
+    } else if ([linkOrLinks isKindOfClass:[NSArray class]]) {
+        return [self extractArrayOfLinks:linkOrLinks];
+    }
+    return nil;
+}
+
+- (NSArray *)extractArrayOfLinks:(NSArray *)linkArray
+{
+    NSMutableArray *links = [NSMutableArray new];
+    for (id dictionary in linkArray) {
+        DSAPILink *link = [[DSAPILink alloc] initWithDictionary:dictionary baseURL:self.client.baseURL];
+        if (!link) {
+            return nil;
+        }
+        [links addObject:link];
+    }
+    return links;
+}
+
+- (BOOL)parseEmbedded
+{
+    return [self parseEmbeddedAtRelation:kEmbeddedKey];
+}
+
+- (BOOL)parseNew
+{
+    return [self parseEmbeddedAtRelation:kNewEntriesKey];
+}
+
+- (BOOL)parseChanged
+{
+    return [self parseEmbeddedAtRelation:kChangedEntriesKey];
+}
+
+- (BOOL)parseEmbeddedAtRelation:(id)relation
+{
+    id embedded = _dictionary[relation];
+    if (!embedded) {
+        return YES;
+    }
+    if ([embedded isKindOfClass:[NSDictionary class]]) {
+        return [self parseEmbeddedDictionaries:embedded];
+    } else if ([embedded isKindOfClass:[NSArray class]]) {
+        return [self parseEmbeddedArrayOfDictionaries:embedded atRelation:relation];
+    }
+    return NO;
+}
+
+- (BOOL)parseEmbeddedDictionaries:(NSDictionary *)embeddedDictionaries
+{
+    for (id relation in [embeddedDictionaries allKeys]) {
+        id resourceOrResources = embeddedDictionaries[relation];
+        [self embedResourceOrResources:resourceOrResources atRelation:relation];
+    }
+    return YES;
+}
+
+- (BOOL)parseEmbeddedArrayOfDictionaries:(NSArray *)embeddedArrayOfDictionaries atRelation:(id)relation
+{
+    [self embedResourceOrResources:embeddedArrayOfDictionaries atRelation:relation];
+    return YES;
+}
+
+- (void)embedResourceOrResources:(id)resourceOrResources atRelation:(id)relation
+{
+    NSArray *resources = [self extractResourceOrResources:resourceOrResources];
+    if (!resources) {
+        _embedded[relation] = [NSNull null];
+    } else {
+        _embedded[relation] = resources;
+    }
+}
+
+- (NSArray *)extractResourceOrResources:(id)resourceOrResources
+{
+    if ([resourceOrResources isKindOfClass:[NSDictionary class]]) {
+        return [self extractArrayOfResources:@[ resourceOrResources ]];
+    } else if ([resourceOrResources isKindOfClass:[NSArray class]]) {
+        return [self extractArrayOfResources:resourceOrResources];
+    }
+    return nil;
+}
+
+- (NSArray *)extractArrayOfResources:(NSArray *)resourceArray
+{
+    NSMutableArray *resources = [NSMutableArray new];
+    for (id dictionary in resourceArray) {
+        DSAPIResource *resource = [[DSAPIResource alloc] initWithDictionary:dictionary client:self.client];
+        if (!resource) {
+            return nil;
+        }
+        [resources addObject:resource];
+    }
+    return resources;
+}
+
+- (DSAPILink *)linkForRelation:(NSString *)relation
+{
+    NSArray *links = [self linksForRelation:relation];
+    return [links count] > 0 ? links[0] : nil;
+}
+
+- (DSAPILink *)linkForRelation:(NSString *)relation className:(NSString *)className
+{
+    NSArray *links = [self linksForRelation:relation];
+    for (DSAPILink *link in links) {
+        if ([className isEqualToString:link.className]) {
+            return link;
+        }
+    }
+    return nil;
+}
+
+- (NSArray *)linksForRelation:(NSString *)relation
+{
+    return _linksArrays[relation] != [NSNull null] ? _linksArrays[relation] : nil;
+}
+
+- (DSAPIResource *)resourceForRelation:(NSString *)relation
+{
+    NSArray *resources = [self resourcesForRelation:relation];
+    return resources[0];
+}
+
+- (NSArray *)resourcesForRelation:(NSString *)relation
+{
+    return _embedded[relation] != [NSNull null] ? _embedded[relation] : nil;
+}
+
+- (NSDictionary *)links
+{
+    return _linksArrays;
+}
+
+- (NSDictionary *)dictionary
+{
+    return _dictionary;
+}
+
+- (DSAPILink *)linkToSelf
+{
+    return [self linkForRelation:kSelfKey];
+}
+
++ (DSAPILink *)classLinkWithBaseURL:(NSURL *)baseURL
+{
+    return [[DSAPILink alloc] initWithDictionary:@{kHrefKey : [NSString stringWithFormat:kAPIPrefix, self.classNamePlural], kClassKey : self.className} baseURL:baseURL];
+}
+
++ (NSString *)className
+{
+    NSString *errorMessage = [NSString stringWithFormat:@"You must override %@ in a subclass", NSStringFromSelector(_cmd)];
+    NSAssert(NO, errorMessage);
+    return nil;
+}
+
++ (NSString *)classNamePlural
+{
+    return [NSString stringWithFormat:@"%@s", self.className];
+}
+
+- (id)objectForKeyedSubscript:(id)key
+{
+    if ([kEmbeddedKey isEqualToString:key]) {
+        return nil;
+    }
+    return _dictionary[key] != [NSNull null] ? _dictionary[key] : nil;
+}
+
+- (id)valueForKey:(NSString *)key
+{
+    id value = [self objectForKeyedSubscript:key];
+    if (value) {
+        return value;
+    }
+    return [super valueForKey:key];
+}
+
+- (void)setObject:(id)obj forKeyedSubscript:(id<NSCopying>)key
+{
+    if ([kLinksKey isEqualToString:(NSString *)key] || [kEmbeddedKey isEqualToString:(NSString *)key]) {
+        return;
+    }
+    if (obj == nil) {
+        [_dictionary removeObjectForKey:key];
+    } else {
+        [_dictionary setObject:obj forKey:key];
+    }
+}
+
+- (void)setValue:(id)value forUndefinedKey:(NSString *)key
+{
+    [self setObject:value forKeyedSubscript:key];
+}
+
+#pragma mark - Generic CRUD Methods
+
++ (NSURLSessionDataTask *)listResourcesAt:(DSAPILink *)link
+                               parameters:(NSDictionary *)parameters
+                                   client:(DSAPIClient *)client
+                                    queue:(NSOperationQueue *)queue
+                                  success:(DSAPIPageSuccessBlock)success
+                                  failure:(DSAPIFailureBlock)failure
+{
+    return [self listResourcesAt:link
+                      parameters:parameters
+                          client:client
+                           queue:(NSOperationQueue *)queue
+                         success:success
+                     notModified:nil
+                         failure:failure];
+}
+
++ (NSURLSessionDataTask *)listResourcesAt:(DSAPILink *)link
+                               parameters:(NSDictionary *)parameters
+                                   client:(DSAPIClient *)client
+                                    queue:(NSOperationQueue *)queue
+                                  success:(DSAPIPageSuccessBlock)success
+                              notModified:(DSAPIPageSuccessBlock)notModified
+                                  failure:(DSAPIFailureBlock)failure
+{
+    NSString *urlString = [[NSURL URLWithString:link.href relativeToURL:client.baseURL] absoluteString];
+    NSError *error = nil;
+    NSMutableURLRequest *request = [client.requestSerializer requestWithMethod:@"GET"
+                                                                     URLString:urlString
+                                                                    parameters:parameters
+                                                                         error:&error];
+    if (error && failure) {
+        failure(nil, error);
+    } else if (!error) {
+        if (notModified) {
+            // This is the cache policy to ignore etag cache headers, instead we set etag header manually below to get notModified callback working.
+            // Eventually we should get rid of this approach and remove notModified argument from the method definition. Instead we should use caching mechanism provided by Apple
+            request.cachePolicy = NSURLRequestReloadIgnoringLocalAndRemoteCacheData;
+            
+            NSString *etag = [[DSAPIETagCache sharedManager] eTagForURL:request.URL];
+            if (etag) {
+                [request setValue:etag forHTTPHeaderField:kIfNoneMatchHeader];
+            }
+        }
+        NSURLSessionDataTask *task =
+        [client dataTaskWithRequest:request
+                              queue:queue
+                            success:^(NSHTTPURLResponse *response, id responseObject) {
+                                DSAPIResource *resource = [responseObject DSAPIResourceWithClient:client];
+                                NSString *etag = [[response allHeaderFields] objectForKey:kETagHeader];
+                                if (etag) {
+                                    [[DSAPIETagCache sharedManager] setETag:etag forURL:request.URL nextPageURL:[resource linkForRelation:kNextKey].URL];
+                                }
+                                if (success) {
+                                    success((DSAPIPage *)resource);
+                                }
+                            }
+                            failure:^(NSHTTPURLResponse *response, NSError *error) {
+                                if (notModified && [response statusCode] == DSC_HTTP_STATUS_NOT_MODIFIED) {
+                                    DSAPIPage *page = [DSAPIPage pageFromPageHref:[[DSAPIETagCache sharedManager] pageURLForURL:request.URL].relativeString withNextPageHref:[[DSAPIETagCache sharedManager] nextPageURLForURL:request.URL].relativeString client:client];
+                                    page.notModified = YES;
+                                    if (notModified) {
+                                        notModified(page);
+                                    }
+                                } else {
+                                    [client postRateLimitingNotificationIfNecessary:response];
+                                    if (failure) {
+                                        failure(response, error);
+                                    }
+                                }
+                            }];
+        
+        [[NSOperationQueue mainQueue] addOperationWithBlock:^{
+            [[DSAPINetworkIndicatorController sharedController] networkActivityDidStart];
+        }];
+        [task resume];
+        
+        return task;
+    }
+    return nil;
+}
+
++ (NSURLSessionDataTask *)searchResourcesAt:(DSAPILink *)link
+                                 parameters:(NSDictionary *)parameters
+                                     client:(DSAPIClient *)client
+                                      queue:(NSOperationQueue *)queue
+                                    success:(DSAPIPageSuccessBlock)success
+                                    failure:(DSAPIFailureBlock)failure
+{
+    return [self searchResourcesAt:link
+                        parameters:parameters
+                            client:client
+                             queue:queue
+                           success:success
+                       notModified:nil
+                           failure:failure];
+}
+
++ (NSURLSessionDataTask *)searchResourcesAt:(DSAPILink *)link
+                                 parameters:(NSDictionary *)parameters
+                                     client:(DSAPIClient *)client
+                                      queue:queue
+                                    success:(DSAPIPageSuccessBlock)success
+                                notModified:(DSAPIPageSuccessBlock)notModified
+                                    failure:(DSAPIFailureBlock)failure
+{
+    return [self listResourcesAt:[self searchEndpointForClassLink:link client:client]
+                      parameters:parameters
+                          client:client
+                           queue:queue
+                         success:success
+                     notModified:notModified
+                         failure:failure];
+}
+
++ (DSAPILink *)searchEndpointForClassLink:(DSAPILink *)classLink client:(DSAPIClient *)client
+{
+    NSString *searchURL = [NSString stringWithFormat:@"%@/%@", classLink.href, kSearchEndpoint];
+    return [[DSAPILink alloc] initWithDictionary:@{kHrefKey : searchURL,
+                                                   kClassKey : classLink.className}
+                                         baseURL:client.baseURL];
+}
+
++ (NSURLSessionDataTask *)createResource:(NSDictionary *)resourceDict
+                                    link:(DSAPILink *)link
+                                  client:(DSAPIClient *)client
+                                   queue:queue
+                                 success:(DSAPIResourceSuccessBlock)success
+                                 failure:(DSAPIFailureBlock)failure
+{
+    return [client POST:link.href
+             parameters:resourceDict
+                  queue:queue
+                success:^(NSHTTPURLResponse *response, id responseObject) {
+                    if (success) {
+                        success([responseObject DSAPIResourceWithClient:client]);
+                    }
+                }
+                failure:^(NSHTTPURLResponse *response, NSError *error) {
+                    [client postRateLimitingNotificationIfNecessary:response];
+                    if (failure) {
+                        failure(response, error);
+                    }
+                }];
+}
+
++ (NSURLSessionDataTask *)showResourceAtLink:(DSAPILink *)linkToResource
+                                  parameters:(NSDictionary *)parameters
+                                      client:(DSAPIClient *)client
+                                       queue:(NSOperationQueue *)queue
+                                     success:(DSAPIResourceSuccessBlock)success
+                                     failure:(DSAPIFailureBlock)failure
+{
+    return [client GET:linkToResource.href
+            parameters:parameters
+                 queue:queue
+               success:^(NSHTTPURLResponse *response, id responseObject) {
+                   if (success) {
+                       success([responseObject DSAPIResourceWithClient:client]);
+                   }
+               }
+               failure:^(NSHTTPURLResponse *response, NSError *error) {
+                   [client postRateLimitingNotificationIfNecessary:response];
+                   if (failure) {
+                       failure(response, error);
+                   }
+               }];
+}
+
+- (NSURLSessionDataTask *)showWithParameters:(NSDictionary *)parameters
+                                       queue:(NSOperationQueue *)queue
+                                     success:(DSAPIResourceSuccessBlock)success
+                                     failure:(DSAPIFailureBlock)failure
+{
+    return [[self class] showResourceAtLink:self.linkToSelf
+                                 parameters:parameters
+                                     client:self.client
+                                      queue:queue
+                                    success:success
+                                    failure:failure];
+}
+
+- (NSURLSessionDataTask *)updateWithDictionary:(NSDictionary *)dictionary
+                                         queue:(NSOperationQueue *)queue
+                                       success:(DSAPIResourceSuccessBlock)success
+                                       failure:(DSAPIFailureBlock)failure
+{
+    return [self.client PATCH:self.linkToSelf.href
+                   parameters:dictionary
+                        queue:queue
+                      success:^(NSHTTPURLResponse *response, id responseObject) {
+                          if (success) {
+                              success([responseObject DSAPIResourceWithClient:self.client]);
+                          }
+                      }
+                      failure:^(NSHTTPURLResponse *response, NSError *error) {
+                          [self.client postRateLimitingNotificationIfNecessary:response];
+                          if (failure) {
+                              failure(response, error);
+                          }
+                      }];
+}
+
+- (NSURLSessionDataTask *)listResourcesForRelation:(NSString *)relation
+                                        parameters:(NSDictionary *)parameters
+                                             queue:(NSOperationQueue *)queue
+                                           success:(DSAPIPageSuccessBlock)success
+                                           failure:(DSAPIFailureBlock)failure
+{
+    return [self listResourcesForRelation:relation
+                               parameters:parameters
+                                    queue:queue
+                                  success:success
+                              notModified:nil
+                                  failure:failure];
+}
+
+- (NSURLSessionDataTask *)listResourcesForRelation:(NSString *)relation
+                                        parameters:(NSDictionary *)parameters
+                                             queue:(NSOperationQueue *)queue
+                                           success:(DSAPIPageSuccessBlock)success
+                                       notModified:(DSAPIPageSuccessBlock)notModified
+                                           failure:(DSAPIFailureBlock)failure
+{
+    DSAPILink *linkToRelation = [self linkForRelation:relation];
+    return [DSAPIResource listResourcesAt:linkToRelation
+                               parameters:parameters
+                                   client:self.client
+                                    queue:queue
+                                  success:success
+                              notModified:notModified
+                                  failure:failure];
+}
+
+- (NSURLSessionDataTask *)deleteWithParameters:(NSDictionary *)parameters
+                                         queue:(NSOperationQueue *)queue
+                                       success:(void (^)(void))success
+                                       failure:(DSAPIFailureBlock)failure
+{
+    return [self.client DELETE:self.linkToSelf.href
+                    parameters:parameters
+                         queue:queue
+                       success:^(NSHTTPURLResponse *response, id responseObject) {
+                           if (success) {
+                               success();
+                           }
+                       }
+                       failure:^(NSHTTPURLResponse *response, NSError *error) {
+                           [self.client postRateLimitingNotificationIfNecessary:response];
+                           if (failure) {
+                               failure(response, error);
+                           }
+                       }];
+}
+
+- (NSString *)idFromSelfLink
+{
+    return [[[self linkToSelf] URL] lastPathComponent];
+}
+
+
+@end
